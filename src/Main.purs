@@ -5,17 +5,17 @@ import Control.Monad.Eff (Eff)
 import Control.Monad.Eff.Console (CONSOLE, log)
 import Control.Monad.Eff.Exception (EXCEPTION)
 import Control.Monad.Except (runExcept)
-import Data.Array (catMaybes, concat, concatMap, groupBy, head, null)
-import Data.Either (Either(..))
+import Data.Array (catMaybes, concat, concatMap, delete, difference, groupBy, head, last, null)
+import Data.Either (Either(..), either)
 import Data.Foldable (foldMap, traverse_)
-import Data.Foreign (F, ForeignError(..), fail, readArray, readString, renderForeignError)
+import Data.Foreign (F, Foreign, ForeignError(..), fail, readArray, readString, renderForeignError)
 import Data.Foreign.Index (index)
 import Data.Foreign.JSON (parseJSON)
 import Data.Foreign.Keys (keys)
 import Data.Function (on)
 import Data.Maybe (Maybe(..), fromMaybe')
 import Data.NonEmpty (NonEmpty(..))
-import Data.String (joinWith)
+import Data.String (Pattern(..), joinWith, split)
 import Data.Traversable (for, traverse)
 import Node.Encoding (Encoding(..))
 import Node.FS (FS)
@@ -30,20 +30,43 @@ type DataConstructor =
   , argNames :: Array String
   }
 
-codegen :: String -> String -> Array DataConstructor -> String
-codegen chosenModuleName importedModuleName ctors =
+moduleDefaultImports :: Array String
+moduleDefaultImports =
+  [ "Prelude"
+  , "Data.Lens"
+  , "Data.Either"
+  ]
+
+codegen :: String -> Array String -> String -> Array DataConstructor -> String
+codegen chosenModuleName moduleImports importedModuleName ctors =
     joinWith "\n" $
-      [ "module " <> chosenModuleName <> " where"
-      , ""
-      , "import Prelude as Prelude"
-      , "import Data.Lens as Lens"
-      , "import Data.Either as Either"
-      , ""
-      , "import " <> importedModuleName
-      , ""
-      ] <> concatMap opticFor typeCtors
+      [ "module " <> chosenModuleName <> " where" ]
+      <> lineBreak
+      -- add default imports
+      <> map importModuleAs moduleDefaultImports
+      <> lineBreak
+      -- add module import
+      <> [importModule importedModuleName]
+      <> lineBreak
+      -- add other imports needed by module
+      <> difference (map importModule moduleImports) moduleDefaultImports
+      <> lineBreak
+      -- add generated prism / iso
+      <> concatMap opticFor typeCtors
   where
     typeCtors = groupBy (eq `on` _.typeName) ctors
+
+    importModule :: String -> String
+    importModule = (<>) "import "
+
+    importModuleAs :: String -> String
+    importModuleAs moduleName =
+      "import " <> moduleName <> case last $ split (Pattern ".") moduleName of
+                                    Just m -> " as " <> m
+                                    Nothing -> ""
+
+    lineBreak :: Array String
+    lineBreak = [""]
 
     opticFor :: NonEmpty Array DataConstructor -> Array String
     opticFor ctors'@(NonEmpty { typeName } rest) = header <> foldMap opticFor' ctors' where
@@ -85,8 +108,10 @@ process outputModuleName input = do
     [moduleName] -> do
       _module <- index json moduleName
       decls <- readArray =<< index _module "decls"
+      moduleImports <- readArray =<< index _module "imports"
+      let moduleImports' = decodeModuleImports moduleImports
       let chosenModuleName = fromMaybe' (\_ -> moduleName <> ".Lenses") outputModuleName
-      codegen chosenModuleName moduleName <<< concat <$> for decls \decl -> do
+      codegen chosenModuleName moduleImports' moduleName <<< concat <$> for decls \decl -> do
         names <- keys decl
         catMaybes <$> for names \name -> do
           ctor <- readArray =<< index decl name
@@ -102,6 +127,14 @@ process outputModuleName input = do
                 _ -> pure Nothing
             _ -> pure Nothing
     _ -> fail (JSONError "Expected a single module")
+    where
+      decodeModuleImports :: Array Foreign -> Array String
+      decodeModuleImports imports = do
+        -- 1. map `Array Foreign` to `Array String`
+        -- 2. Get rid of `Prim`
+        delete "Prim" $ map (either (const "") id <<< runExcept <<< readString) imports
+
+
 
 app :: forall eff
      . String
